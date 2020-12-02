@@ -98,7 +98,7 @@ class Connection(object):
     """Wraps a Thrift session"""
 
     def __init__(self, host=None, port=None, username=None, database='default', auth=None,
-                 configuration=None, kerberos_service_name=None, password=None,
+                 configuration=None, kerberos_service_name=None, zookeeper_name_space=None, password=None,
                  thrift_transport=None):
         """Connect to HiveServer2
 
@@ -119,7 +119,7 @@ class Connection(object):
         username = username or getpass.getuser()
         configuration = configuration or {}
 
-        if (password is not None) != (auth in ('LDAP', 'CUSTOM')):
+        if (password is not None) != (auth in ('LDAP', 'CUSTOM', 'ZOOKEEPER')):
             raise ValueError("Password should be set if and only if in LDAP or CUSTOM mode; "
                              "Remove password or use one of those modes")
         if (kerberos_service_name is not None) != (auth == 'KERBEROS'):
@@ -130,6 +130,7 @@ class Connection(object):
                 or port is not None
                 or auth is not None
                 or kerberos_service_name is not None
+                or zookeeper_name_space is not None
                 or password is not None
             )
             if has_incompatible_arg:
@@ -143,15 +144,18 @@ class Connection(object):
                 port = 10000
             if auth is None:
                 auth = 'NONE'
-            socket = thrift.transport.TSocket.TSocket(host, port)
+            
             if auth == 'NOSASL':
+                socket = thrift.transport.TSocket.TSocket(host, port)
                 # NOSASL corresponds to hive.server2.authentication=NOSASL in hive-site.xml
                 self._transport = thrift.transport.TTransport.TBufferedTransport(socket)
             elif auth in ('LDAP', 'KERBEROS', 'NONE', 'CUSTOM'):
                 # Defer import so package dependency is optional
+                socket1 = thrift.transport.TSocket.TSocket(host, port)
+
                 import sasl
                 import thrift_sasl
-
+                
                 if auth == 'KERBEROS':
                     # KERBEROS mode in hive.server2.authentication is GSSAPI in sasl library
                     sasl_auth = 'GSSAPI'
@@ -173,7 +177,59 @@ class Connection(object):
                         raise AssertionError
                     sasl_client.init()
                     return sasl_client
-                self._transport = thrift_sasl.TSaslClientTransport(sasl_factory, sasl_auth, socket)
+                self._transport = thrift_sasl.TSaslClientTransport(sasl_factory, sasl_auth, socket1)
+            
+            # Custom Defined the Zookeeper options
+            elif auth == 'ZOOKEEPER':
+
+                def discovery_thrift_service_host(zookeeper_host, zookeeper_name_space):
+                    
+                    zk_name_space = zookeeper_name_space
+                    zk_client = KazooClient(hosts=zookeeper_host, logger=logging)
+                    zk_client.start()
+                    # get the children name of zonde
+                    if zk_name_space.startswith("/"):
+                        name_space_with_prefix = zk_name_space
+                    else:
+                        name_space_with_prefix = "/" + zk_name_space
+                    node_children = zk_client.get_children(name_space_with_prefix)
+                    host_list = list()
+                    for node in node_children:
+                        sub_node_name_space = name_space_with_prefix + "/" + node
+                        data, _ = zk_client.get(sub_node_name_space)
+                        data_list = str(data)[2:-1].split(";")
+                        for i in data_list:
+                            if (i.find(":")>-1):
+                                host_list = re.split('[=:]',i)
+                    zk_client.stop()
+                    return host_list
+                
+                if auth == 'ZOOKEEPER':
+                    from kazoo.client import KazooClient
+                    import sasl
+                    import thrift_sasl
+
+                    zookeeper_host = host+":"+port
+                    host_list = discovery_thrift_service_host(zookeeper_host, zookeeper_name_space)
+                    new_host_name = host_list[1]
+                    new_host_port = host_list[2]
+
+                    socket2 = thrift.transport.TSocket.TSocket(new_host_name, new_host_port)
+ 
+                    sasl_auth = 'PLAIN'
+                            
+                    def sasl_factory():
+                        sasl_client = sasl.Client()
+                        sasl_client.setAttr('host', new_host_name)
+                        if sasl_auth == 'PLAIN':
+                            sasl_client.setAttr('username', username)
+                            sasl_client.setAttr('password', password)
+                        else:
+                            raise AssertionError
+                        sasl_client.init()
+                        return sasl_client
+                    self._transport = thrift_sasl.TSaslClientTransport(sasl_factory, sasl_auth, socket2)
+                    
             else:
                 # All HS2 config options:
                 # https://cwiki.apache.org/confluence/display/Hive/Setting+Up+HiveServer2#SettingUpHiveServer2-Configuration
